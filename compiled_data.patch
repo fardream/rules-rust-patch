@@ -1,0 +1,122 @@
+diff --git a/rust/private/rust.bzl b/rust/private/rust.bzl
+index 484e35d3..713fa5ea 100644
+--- a/rust/private/rust.bzl
++++ b/rust/private/rust.bzl
+@@ -148,7 +148,7 @@ def _rust_library_common(ctx, crate_type):
+     crate_root = getattr(ctx.file, "crate_root", None)
+     if not crate_root:
+         crate_root = crate_root_src(ctx.attr.name, ctx.files.srcs, crate_type)
+-    srcs, crate_root = transform_sources(ctx, ctx.files.srcs, crate_root)
++    srcs, compile_data_new, crate_root = transform_sources(ctx, ctx.files.srcs, ctx.files.compile_data, crate_root)
+ 
+     # Determine unique hash for this rlib.
+     # Note that we don't include a hash for `cdylib` and `staticlib` since they are meant to be consumed externally
+@@ -197,7 +197,7 @@ def _rust_library_common(ctx, crate_type):
+             rustc_env_files = ctx.files.rustc_env_files,
+             is_test = False,
+             data = depset(ctx.files.data),
+-            compile_data = depset(ctx.files.compile_data),
++            compile_data = depset(compile_data_new),
+             compile_data_targets = depset(ctx.attr.compile_data),
+             owner = ctx.label,
+         ),
+@@ -224,7 +224,7 @@ def _rust_binary_impl(ctx):
+     crate_root = getattr(ctx.file, "crate_root", None)
+     if not crate_root:
+         crate_root = crate_root_src(ctx.attr.name, ctx.files.srcs, ctx.attr.crate_type)
+-    srcs, crate_root = transform_sources(ctx, ctx.files.srcs, crate_root)
++    srcs, compile_data_new, crate_root = transform_sources(ctx, ctx.files.srcs, ctx.files.compile_data, crate_root)
+ 
+     return rustc_compile_action(
+         ctx = ctx,
+@@ -243,7 +243,7 @@ def _rust_binary_impl(ctx):
+             rustc_env = ctx.attr.rustc_env,
+             rustc_env_files = ctx.files.rustc_env_files,
+             is_test = False,
+-            compile_data = depset(ctx.files.compile_data),
++            compile_data = depset(compile_data_new),
+             compile_data_targets = depset(ctx.attr.compile_data),
+             owner = ctx.label,
+         ),
+@@ -280,8 +280,6 @@ def _rust_test_impl(ctx):
+             ),
+         )
+ 
+-        srcs, crate_root = transform_sources(ctx, ctx.files.srcs, getattr(ctx.file, "crate_root", None))
+-
+         # Optionally join compile data
+         if crate.compile_data:
+             compile_data = depset(ctx.files.compile_data, transitive = [crate.compile_data])
+@@ -293,6 +291,10 @@ def _rust_test_impl(ctx):
+             compile_data_targets = depset(ctx.attr.compile_data)
+         rustc_env_files = ctx.files.rustc_env_files + crate.rustc_env_files
+ 
++        srcs, compile_data_new, crate_root = transform_sources(ctx, ctx.files.srcs, compile_data.to_list(), getattr(ctx.file, "crate_root", None))
++
++        compile_data = depset(compile_data_new)
++
+         # crate.rustc_env is already expanded upstream in rust_library rule implementation
+         rustc_env = dict(crate.rustc_env)
+         data_paths = depset(direct = getattr(ctx.attr, "data", [])).to_list()
+@@ -327,7 +329,7 @@ def _rust_test_impl(ctx):
+         if not crate_root:
+             crate_root_type = "lib" if ctx.attr.use_libtest_harness else "bin"
+             crate_root = crate_root_src(ctx.attr.name, ctx.files.srcs, crate_root_type)
+-        srcs, crate_root = transform_sources(ctx, ctx.files.srcs, crate_root)
++        srcs, compile_data_new, crate_root = transform_sources(ctx, ctx.files.srcs, ctx.files.compile_data, crate_root)
+ 
+         output_hash = determine_output_hash(crate_root, ctx.label)
+         output = ctx.actions.declare_file(
+@@ -359,7 +361,7 @@ def _rust_test_impl(ctx):
+             rustc_env = rustc_env,
+             rustc_env_files = ctx.files.rustc_env_files,
+             is_test = True,
+-            compile_data = depset(ctx.files.compile_data),
++            compile_data = depset(compile_data_new),
+             compile_data_targets = depset(ctx.attr.compile_data),
+             owner = ctx.label,
+         )
+diff --git a/rust/private/utils.bzl b/rust/private/utils.bzl
+index 7b0fe23e..60a12f2f 100644
+--- a/rust/private/utils.bzl
++++ b/rust/private/utils.bzl
+@@ -770,7 +770,7 @@ def determine_lib_name(name, crate_type, toolchain, lib_hash = None):
+         extension = extension,
+     )
+ 
+-def transform_sources(ctx, srcs, crate_root):
++def transform_sources(ctx, srcs, compile_data, crate_root):
+     """Creates symlinks of the source files if needed.
+ 
+     Rustc assumes that the source files are located next to the crate root.
+@@ -783,25 +783,27 @@ def transform_sources(ctx, srcs, crate_root):
+     Args:
+         ctx (struct): The current rule's context.
+         srcs (List[File]): The sources listed in the `srcs` attribute
++        compile_data (List[File]): The sources listed in the `compile_data` attribute
+         crate_root (File): The file specified in the `crate_root` attribute,
+                            if it exists, otherwise None
+ 
+     Returns:
+         Tuple(List[File], File): The transformed srcs and crate_root
+     """
+-    has_generated_sources = len([src for src in srcs if not src.is_source]) > 0
++    has_generated_sources = (len([src for src in srcs if not src.is_source]) + len([src for src in compile_data if not src.is_source])) > 0
+ 
+     if not has_generated_sources:
+-        return srcs, crate_root
++        return srcs, compile_data, crate_root
+ 
+     package_root = paths.dirname(paths.join(ctx.label.workspace_root, ctx.build_file_path))
+     generated_sources = [_symlink_for_non_generated_source(ctx, src, package_root) for src in srcs if src != crate_root]
++    generated_compiled_data = [_symlink_for_non_generated_source(ctx, src, package_root) for src in compile_data if src != crate_root]
+     generated_root = crate_root
+     if crate_root:
+         generated_root = _symlink_for_non_generated_source(ctx, crate_root, package_root)
+         generated_sources.append(generated_root)
+ 
+-    return generated_sources, generated_root
++    return generated_sources, generated_compiled_data, generated_root
+ 
+ def get_edition(attr, toolchain, label):
+     """Returns the Rust edition from either the current rule's attributes or the current `rust_toolchain`
